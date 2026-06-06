@@ -231,7 +231,7 @@ function applyBothWithCustomSpaces(rawStr, matches) {
         }
     }
     
-    return result;
+    return result.replace(/[\s-]+/g, '-').replace(/^-|-$/g, '');
 }
 
 module.exports = { classifyEngine, applyBoth, applyBothWithCustomSpaces, CAT };

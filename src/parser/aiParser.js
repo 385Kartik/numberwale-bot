@@ -115,7 +115,7 @@ async function handleMessage(sock, sender, text, defaultVendorId) {
                 });
 
                 let formattedAddedList = successfullyAddedItems.map(item => {
-                    const rateStr = item.rate ? `${item.rate}rs` : "No Price";
+                    const rateStr = item.rate ? `Rs.${item.rate}` : "No Price";
                     const discStr = item.discount && item.discount !== "0" ? `${item.discount}%` : "0%";
                     const portStr = item.port || "RTP";
                     return `• ${item.number} | ${rateStr} | ${discStr} | ${portStr}`.trim();
@@ -134,7 +134,8 @@ async function handleMessage(sock, sender, text, defaultVendorId) {
                     soldMsg = `\n\n⚠️ The following numbers were not added because they are already sold:\n${soldNumbers.join(', ')}`;
                 }
 
-                await sock.sendMessage(sender, { text: `${successMsg}${soldMsg}${invalidMsg}` });
+                const finalMessageText = `${successMsg}${soldMsg}${invalidMsg}`;
+                await sock.sendMessage(sender, { text: finalMessageText });
 
             } else if (parsed.action === 'REMOVE') {
                 if (!finalVendorId || !finalVendorId.includes('@')) {
@@ -170,7 +171,8 @@ async function handleMessage(sock, sender, text, defaultVendorId) {
                     ? `✅ These numbers are removed successfully:\n${numsRemoved.join(', ')}` 
                     : `❌ No numbers were removed.`;
 
-                await sock.sendMessage(sender, { text: `${successMsg}${unauthorizedMsg}${failedMsg}` });
+                const finalRemoveText = `${successMsg}${unauthorizedMsg}${failedMsg}`;
+                await sock.sendMessage(sender, { text: finalRemoveText });
             }
         } else if (parsed.action === 'INQUIRY') {
             const finalVendorId = parsed.vendor_email || defaultVendorId;
@@ -213,6 +215,11 @@ async function handleMessage(sock, sender, text, defaultVendorId) {
         }
     } catch (err) {
         console.error('Parser error:', err.message);
+        if (err.message.includes('429') || err.message.includes('RESOURCE_EXHAUSTED') || err.message.includes('prepayment credits')) {
+            await sock.sendMessage(sender, { text: "⚠️ System Error: AI limit reached or credits depleted. Please contact admin." }).catch(console.error);
+        } else {
+            await sock.sendMessage(sender, { text: "⚠️ Sorry, I encountered an internal error while processing your message." }).catch(console.error);
+        }
     }
 }
 
@@ -242,7 +249,7 @@ OUTPUT SCHEMA (strictly follow this, no extra fields):
   "action": "ADD" | "REMOVE" | "DEACTIVATE" | "ACTIVATE" | "UPC" | "INQUIRY" | "IGNORE",
   "inquiry_type": "OUTSTANDING" | "NUMBERS" | "ALL" | null,
   "items": [
-    { "number": "<10-digit string>", "rate": "<digits only, max 8>", "discount": "0", "port": "RTP" | "CRTP" }
+    { "number": "<mobile number>", "rate": "<digits only, max 8>", "discount": "0", "port": "RTP" | "CRTP" }
   ]
 }
 
@@ -256,12 +263,12 @@ CLASSIFICATION RULES:
 - IGNORE     - casual chat, greetings, unrelated messages
 
 EXTRACTION RULES:
-- Phone numbers are exactly 10 digits (ignoring spaces). Do NOT confuse rates/prices (1-5 digits) for phone numbers.
+- Phone numbers are usually 10 digits, but extract ANY sequence that looks like a phone number (e.g., 7 to 15 digits). Do NOT confuse rates/prices (1-6 digits) for phone numbers.
 - IMPORTANT: In 'number', preserve any spaces or dashes exactly as typed by the vendor. (e.g., if vendor types "99 88 77 66 55", extract it exactly as "99 88 77 66 55").
 - You MUST extract the 'rate' if provided. Rates can be prefixed with '@' or 'rs' (e.g. "@55000" -> "55000"). Rate is usually the 3 to 6 digit number next to the phone number.
 - Strip country codes (+91, 0091) but preserve leading zeros if the number itself starts with 0.
 - 'rate' must contain digits only, max 8 digits. If missing or unclear, use "".
-- 'discount' must contain digits only. If missing, use "0".
+- 'discount' must contain digits only. If the message mentions a global discount like "All 10% discount" or "Flat 10%", apply it to ALL extracted numbers. If missing, use "0".
 - If rate or discount is missing, use "" or "0". Never omit the field.
 - 'port': use "CRTP" only if explicitly stated for that number or for the whole message. "READY TO PORT" and "RTP" mean "RTP". Default is "RTP".
 - Ignore all emojis like 📩 and decorative characters in your extraction and classification.
@@ -277,7 +284,7 @@ ${DELIM_END}
 Return only the JSON object. No explanation, no markdown, no preamble.`;
 
     const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-lite',
+        model: 'gemini-1.5-flash',
         contents: prompt,
         config: {
             temperature: 0,
