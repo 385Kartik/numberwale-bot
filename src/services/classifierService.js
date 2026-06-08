@@ -249,6 +249,20 @@ function applyBothWithCustomSpaces(rawStr, matches) {
     if (!matches || matches.length === 0) return dashedStr.replace(/^-|-$/g, '');
     
     let sorted = [...matches].sort((a,b) => a[0] - b[0]);
+    let mergedMatches = [];
+    if (sorted.length > 0) {
+        let current = [...sorted[0]];
+        for (let i = 1; i < sorted.length; i++) {
+            if (sorted[i][0] === current[1]) {
+                current[1] = sorted[i][1];
+            } else {
+                mergedMatches.push(current);
+                current = [...sorted[i]];
+            }
+        }
+        mergedMatches.push(current);
+    }
+    
     let result = '';
     let digitIdx = 0;
     
@@ -257,7 +271,7 @@ function applyBothWithCustomSpaces(rawStr, matches) {
         let isDigit = /\d/.test(char);
         
         if (isDigit) {
-            for (let [start, end] of sorted) {
+            for (let [start, end] of mergedMatches) {
                 if (digitIdx === start) result += '*';
             }
         }
@@ -266,7 +280,7 @@ function applyBothWithCustomSpaces(rawStr, matches) {
         
         if (isDigit) {
             digitIdx++;
-            for (let [start, end] of sorted) {
+            for (let [start, end] of mergedMatches) {
                 if (digitIdx === end) result += '*';
             }
         }
@@ -280,30 +294,46 @@ function processText(text, withSpace = false) {
     let validNumbers = [];
     let invalidNumbers = [];
     
+    let emojiLegend = {};
+
+    lines.forEach(line => {
+        let emojiMatch = line.match(/(\d+)\s*=\s*([^\d\s\w]+)/);
+        if (emojiMatch) {
+            emojiLegend[emojiMatch[2].trim()] = emojiMatch[1];
+        }
+    });
+
+    let extractedItems = [];
+    
     lines.forEach(line => {
         let rawLine = line.trim();
-        if (!rawLine) return;
+        let normalizedLine = rawLine.replace(/(\d)[Oo]+/g, (m) => m.replace(/[Oo]/g, '0'));
+        normalizedLine = normalizedLine.replace(/[Oo]+(\d)/g, (m) => m.replace(/[Oo]/g, '0'));
+
+        if (!normalizedLine) return;
         
-        let totalDigitsInLine = rawLine.replace(/\D/g, '').length;
-        // Ignore lines with very few digits (likely text like "10% discount", "rate 500")
-        if (totalDigitsInLine > 0 && totalDigitsInLine < 7) {
-            return;
+        let blockRateMatch = normalizedLine.match(/(?:rs\.?|₹|rate:?|price:?|pick any)\s*(\d+(?:[.,]\d+)?)(k)?\s*(?:\/|-|each|fixed|₹|\*|👇|👆|$)/i);
+        if (blockRateMatch) {
+            let baseRate = parseFloat(blockRateMatch[1].replace(',', ''));
+            if (blockRateMatch[2] && blockRateMatch[2].toLowerCase() === 'k') baseRate *= 1000;
+            extractedItems.push({ type: 'rate', rateStr: String(baseRate) });
         }
 
-        // Clean common prefixes
-        let cleanLine = rawLine.replace(/^(add|remove|delete)\s+/i, '').trim();
+        let totalDigitsInLine = normalizedLine.replace(/\D/g, '').length;
+        if (totalDigitsInLine > 0 && totalDigitsInLine < 7) return;
 
+        let cleanLine = normalizedLine.replace(/^(add|remove|delete)\s+/i, '').trim();
         let numStr = '';
         let rateStr = '';
 
-        // 1. Try explicit separators first
-        let explicitSepMatch = cleanLine.match(/^(.*?)(?:@|rs\.?|₹|rate:?|price:?)\s*(\d+)\s*$/i);
+        let explicitSepMatch = cleanLine.match(/^(.*?)(?:@|rs\.?|₹|rate:?|price:?)\s*(\d+(?:\.\d+)?)(k)?\s*$/i);
         
         if (explicitSepMatch) {
             numStr = explicitSepMatch[1].trim();
-            rateStr = explicitSepMatch[2].trim();
+            let baseRate = parseFloat(explicitSepMatch[2]);
+            if (explicitSepMatch[3] && explicitSepMatch[3].toLowerCase() === 'k') baseRate *= 1000;
+            rateStr = String(baseRate);
         } else {
-            // 2. Tokenize by digit groups to avoid splitting a rate block
             let digitRegex = /\d+/g;
             let match;
             let currentDigits = 0;
@@ -312,13 +342,11 @@ function processText(text, withSpace = false) {
             while ((match = digitRegex.exec(cleanLine)) !== null) {
                 let group = match[0];
                 if (currentDigits + group.length > 10) {
-                    // This group pushes us over 10 digits. Stop here.
                     splitIndex = match.index;
                     break;
                 }
                 currentDigits += group.length;
                 if (currentDigits === 10) {
-                    // Reached exactly 10 digits. Next parts are rate.
                     splitIndex = match.index + group.length;
                     break;
                 }
@@ -326,7 +354,15 @@ function processText(text, withSpace = false) {
 
             if (splitIndex !== -1) {
                 numStr = cleanLine.substring(0, splitIndex).trim();
-                rateStr = cleanLine.substring(splitIndex).replace(/[^\d]/g, '').trim();
+                let remaining = cleanLine.substring(splitIndex).trim();
+                let kMatch = remaining.match(/(\d+(?:\.\d+)?)(k)/i);
+                if (kMatch) {
+                    rateStr = String(parseFloat(kMatch[1]) * 1000);
+                } else {
+                    // Remove any discount percentage tokens (like "2%", "12 %") before extracting digits
+                    let remainingNoDiscount = remaining.replace(/\b\d+(?:\.\d+)?\s*%/g, '');
+                    rateStr = remainingNoDiscount.replace(/[^\d]/g, '').trim();
+                }
             } else {
                 numStr = cleanLine;
                 rateStr = '';
@@ -336,32 +372,67 @@ function processText(text, withSpace = false) {
         let cleanNum = numStr.replace(/\D/g, '');
         let hasDigits = /\d/.test(rawLine);
         
-        // If the line has numbers, but the extracted phone part is not exactly 10, mark it invalid
         if (hasDigits && cleanNum.length !== 10) {
-            invalidNumbers.push(rawLine);
+            extractedItems.push({ type: 'invalid', rawLine });
             return;
         }
 
         if (cleanNum && cleanNum.length === 10) {
-            const res = classifyEngine(cleanNum);
-            
-            let styled = '';
-            if (withSpace) {
-                styled = applyBothWithCustomSpaces(numStr, res.matches);
-            } else {
-                styled = applyBoth(cleanNum, res.matches, res.catId);
+            let inlineEmojiRate = '';
+            for (let emoji in emojiLegend) {
+                if (rawLine.includes(emoji)) {
+                    inlineEmojiRate = emojiLegend[emoji];
+                    break;
+                }
             }
-            
-            // Removed asterisk cleaning to preserve them for the database/UI
+            if (!rateStr && inlineEmojiRate) rateStr = inlineEmojiRate;
 
-            validNumbers.push({
-                number: cleanNum, 
-                styledNumber: styled,
-                categoryId: res.catId,
-                vendorRate: rateStr || null
+            extractedItems.push({
+                type: 'number',
+                number: cleanNum,
+                numStr: numStr,
+                rateStr: rateStr || null
             });
         }
     });
+
+    let currentBottomUpRate = null;
+    for (let i = extractedItems.length - 1; i >= 0; i--) {
+        let item = extractedItems[i];
+        if (item.type === 'rate') {
+            currentBottomUpRate = item.rateStr;
+        } else if (item.type === 'number' && !item.rateStr && currentBottomUpRate) {
+            item.rateStr = currentBottomUpRate;
+        }
+    }
+
+    let currentTopDownRate = null;
+    for (let i = 0; i < extractedItems.length; i++) {
+        let item = extractedItems[i];
+        if (item.type === 'rate') {
+            currentTopDownRate = item.rateStr;
+        } else if (item.type === 'number') {
+            if (!item.rateStr && currentTopDownRate) item.rateStr = currentTopDownRate;
+            
+            const res = classifyEngine(item.number);
+            let styled = '';
+            if (withSpace) {
+                let cleanNumStr = item.numStr.replace(/[*_~]/g, '');
+                styled = applyBothWithCustomSpaces(cleanNumStr, res.matches);
+            } else {
+                styled = applyBoth(item.number, res.matches, res.catId);
+            }
+            
+            validNumbers.push({
+                number: item.number,
+                styledNumber: styled,
+                categoryId: res.catId,
+                vendorRate: item.rateStr || null
+            });
+        } else if (item.type === 'invalid') {
+            invalidNumbers.push(item.rawLine);
+        }
+    }
     
     return { validNumbers, invalidNumbers };
 }

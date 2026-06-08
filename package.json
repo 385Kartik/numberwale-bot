@@ -19,6 +19,7 @@
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "form-data": "^4.0.5",
+    "groq-sdk": "^1.2.1",
     "mongoose": "^9.6.3",
     "openai": "^6.41.0",
     "pino": "^10.3.1",

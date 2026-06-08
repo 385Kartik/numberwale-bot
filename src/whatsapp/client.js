@@ -66,16 +66,22 @@ async function processVendorMessage(sock, msg, sender, vendorId) {
         console.log(`   ➜ Discount: ${parsedIntent.vendorDiscount || 'None'}`);
         console.log(`   ➜ Keep Spacing: ${parsedIntent.keepSpacing}`);
 
-        if (parsedIntent.action === 'IGNORE') {
-             console.log(`[⏭️ IGNORED] AI marked as IGNORE.`);
-             await sock.sendMessage(sender, { text: "⚠️ Mujhe samajh nahi aaya. Kripya numbers bhejein ya koi valid request likhein (jaise 'add', 'remove')." });
+        if (parsedIntent.action === 'IGNORE' || parsedIntent.action === 'HELP') {
+             console.log(`[⏭️ ${parsedIntent.action}] AI marked as ${parsedIntent.action}.`);
+             let replyText = "";
+             if (parsedIntent.action === 'HELP') {
+                 replyText = await generateReply('HELP');
+             } else {
+                 replyText = parsedIntent.reply_message || "⚠️ I didn't understand. Please send a valid request or list of numbers to add/remove.";
+             }
+             await sock.sendMessage(sender, { text: replyText });
              return;
         }
 
         if (parsedIntent.action === 'DEACTIVATE' || parsedIntent.action === 'ACTIVATE') {
             const targetStatus = parsedIntent.action === 'DEACTIVATE' ? 'vendor deactivated' : 'available';
-            await importService.updateVendorStatus(vendorId, targetStatus);
-            const replyMsg = await generateReply(parsedIntent.action);
+            const apiResult = await importService.updateVendorStatus(vendorId, targetStatus);
+            const replyMsg = await generateReply(parsedIntent.action, 0, [], [], [], null, [], apiResult);
             await sock.sendMessage(sender, { text: replyMsg });
             return;
         }
@@ -148,27 +154,37 @@ async function processVendorMessage(sock, msg, sender, vendorId) {
             let addResultData = isDocument && addBuffer ? processExcelBuffer(addBuffer, parsedIntent.keepSpacing) : processText(addText, parsedIntent.keepSpacing);
             
             if (addResultData.validNumbers.length > 0) {
-                const itemsToAdd = addResultData.validNumbers.map(v => ({
-                    number: v.number,
-                    styledNumber: v.styledNumber,
-                    category: v.categoryId, 
-                    rate: v.vendorRate || parsedIntent.vendorRate || '',
-                    discount: parsedIntent.vendorDiscount || '0',
-                    port: parsedIntent.readyToPort || 'RTP'
-                }));
+                const itemsToAdd = [];
+                const noRateNumbers = [];
+                
+                addResultData.validNumbers.forEach(v => {
+                    let rateVal = v.vendorRate || parsedIntent.vendorRate || '';
+                    if (!rateVal || rateVal === '0') {
+                        noRateNumbers.push(v.number);
+                    } else {
+                        itemsToAdd.push({
+                            number: v.number,
+                            styledNumber: v.styledNumber,
+                            category: v.categoryId, 
+                            rate: rateVal,
+                            discount: parsedIntent.vendorDiscount || '0',
+                            port: parsedIntent.readyToPort || 'RTP'
+                        });
+                    }
+                });
 
-                console.log(`\n[☁️ UPLOAD] Uploading ${addResultData.validNumbers.length} numbers to server...`);
-                // Show top 3 numbers being uploaded in the console for clarity
-                const sample = addResultData.validNumbers.slice(0, 3).map(n => n.styledNumber).join(', ');
-                console.log(`   ➜ Sample: ${sample}${addResultData.validNumbers.length > 3 ? '...' : ''}`);
-
-                await importService.processAndImport(itemsToAdd, vendorId, parsedIntent.keepSpacing);
+                if (itemsToAdd.length > 0) {
+                    console.log(`\n[☁️ UPLOAD] Uploading ${itemsToAdd.length} numbers to server...`);
+                    const sample = itemsToAdd.slice(0, 3).map(n => n.styledNumber).join(', ');
+                    console.log(`   ➜ Sample: ${sample}${itemsToAdd.length > 3 ? '...' : ''}`);
+                    await importService.processAndImport(itemsToAdd, vendorId, parsedIntent.keepSpacing);
+                }
                 
                 if (combinedReply.length > 0) combinedReply += "\n\n";
-                combinedReply += await generateReply('ADD', itemsToAdd, addResultData.invalidNumbers);
+                combinedReply += await generateReply('ADD', itemsToAdd, addResultData.invalidNumbers, null, null, null, noRateNumbers, null, parsedIntent.keepSpacing);
             } else {
                 if (combinedReply.length > 0) combinedReply += "\n\n";
-                combinedReply += await generateReply('ADD', 0, addResultData.invalidNumbers);
+                combinedReply += await generateReply('ADD', [], addResultData.invalidNumbers, null, null, null, [], null, parsedIntent.keepSpacing);
             }
         }
 
@@ -189,7 +205,7 @@ async function connectToWhatsApp() {
 
     sock = makeWASocket({
         auth: state,
-        logger: pino({ level: 'silent' }), // Switched from debug to silent to avoid JSON log spam
+        logger: pino({ level: 'error' }), // Enable error logs to see why it crashes
         browser: ["NumberwaleBot", "Chrome", "1.0.0"],
     });
 
@@ -206,9 +222,11 @@ async function connectToWhatsApp() {
         if (connection === 'close') {
             isConnected = false;
             currentQR = null;
-            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             if (shouldReconnect) {
-                connectToWhatsApp();
+                console.log(`⚠️ Connection dropped (Status: ${statusCode}, Reason: ${lastDisconnect?.error?.message}). Reconnecting in 3 seconds...`);
+                setTimeout(connectToWhatsApp, 3000);
             } else {
                 console.log('❌ Logged out from WhatsApp! Deleting session folder...');
                 require('fs').rmSync('auth_info_baileys', { recursive: true, force: true });

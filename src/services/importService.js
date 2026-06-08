@@ -78,33 +78,47 @@ async function processAndImport(items, vendorId, keepSpacing = false) {
         console.table(tableData);
         
 
-        console.log(`\n[📤 API] Generating Excel file in memory...`);
-        const wsData = [
-            ['Vanity Number', 'Styled Number', 'Category ID',
-             'Ready to Port', 'Vendor Rate', 'Vendor Discount', 'Vendor ID'],
-            ...rows
-        ];
-        const wb = XLSX.utils.book_new();
-        const ws = XLSX.utils.aoa_to_sheet(wsData);
-        XLSX.utils.book_append_sheet(wb, ws, 'Classified');
-        const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+        const CHUNK_SIZE = 500;
+        const totalBatches = Math.ceil(rows.length / CHUNK_SIZE);
+        
+        for (let i = 0; i < totalBatches; i++) {
+            const start = i * CHUNK_SIZE;
+            const chunk = rows.slice(start, start + CHUNK_SIZE);
+            
+            console.log(`\n[📤 API] Generating Excel file for Batch ${i + 1}/${totalBatches} (${chunk.length} numbers)...`);
+            const wsData = [
+                ['Vanity Number', 'Styled Number', 'Category ID',
+                 'Ready to Port', 'Vendor Rate', 'Vendor Discount', 'Vendor ID'],
+                ...chunk
+            ];
+            const wb = XLSX.utils.book_new();
+            const ws = XLSX.utils.aoa_to_sheet(wsData);
+            XLSX.utils.book_append_sheet(wb, ws, 'Classified');
+            const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
 
-        const form = new FormData();
-        form.append('files', buffer, {
-            filename: 'bot-import.xlsx',
-            contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        });
+            const form = new FormData();
+            form.append('files', buffer, {
+                filename: `bot-import-batch-${i + 1}.xlsx`,
+                contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            });
 
-        console.log(`[📤 API] Pushing Excel data to /api/v1/bot-api/import...`);
-        const response = await client.post(
-            `${BASE_URL}/api/v1/bot-api/import`,
-            form,
-            { headers: form.getHeaders() }
-        );
+            console.log(`[📤 API] Pushing Batch ${i + 1}/${totalBatches} to /api/v1/products/import...`);
+            const response = await client.post(
+                `${BASE_URL}/api/v1/products/import`,
+                form,
+                { headers: form.getHeaders() }
+            );
 
-        console.log(`[📤 API] Import API Response: ${response.status} ${response.statusText}`);
-        if(response.data) console.log(`[📤 API] Response Data: ${JSON.stringify(response.data)}`);
-        return response.data;
+            console.log(`[📤 API] Batch ${i + 1} Response: ${response.status} ${response.statusText}`);
+            if(response.data) console.log(`[📤 API] Batch ${i + 1} Data: ${JSON.stringify(response.data)}`);
+            
+            // Wait 2 seconds before uploading the next batch to let server breathe
+            if (i < totalBatches - 1) {
+                await new Promise(r => setTimeout(r, 2000));
+            }
+        }
+        
+        return { success: true, message: `Successfully processed ${totalBatches} batches.` };
     } catch (err) {
         console.error('[❌ API ERROR] Import failed:', err.response?.data || err.message);
         throw err;
@@ -116,7 +130,7 @@ async function removeNumbers(numbers, vendorEmail) {
     const cleanNumbers = numbers.map(num => String(num.number || num).replace(/\D/g, ''));
     
     try {
-        const res = await client.post(`${BASE_URL}/api/v1/bot-api/bulk-sold`, { 
+        const res = await client.post(`${BASE_URL}/api/v1/products/bulk-mark-sold-by-vendor`, { 
             mobileNumbers: cleanNumbers,
             vendorEmail: vendorEmail
         });
@@ -136,7 +150,7 @@ async function updateVendorStatus(vendorEmail, targetStatus) {
     try {
         const desiredActive = targetStatus === 'available';
         
-        const res = await client.put(`${BASE_URL}/api/v1/bot-api/vendor-toggle`, {
+        const res = await client.put(`${BASE_URL}/api/v1/vendors/action/toggle-by-email`, {
             email: vendorEmail,
             active: desiredActive
         });
@@ -163,7 +177,7 @@ async function getVendorInquiry(vendorEmail) {
         console.log(`\n[🔍 API] Fetching inquiry data for ${vendorEmail}...`);
 
         
-        const res = await client.get(`${BASE_URL}/api/v1/bot-api/vendor-inquiry?email=${vendorEmail}`);
+        const res = await client.get(`${BASE_URL}/api/v1/oldOrder/bot-inquiry?email=${vendorEmail}`);
         if (res.data && res.data.success) {
             return res.data.data;
         }

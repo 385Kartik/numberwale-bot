@@ -1,171 +1,290 @@
-const { GoogleGenAI } = require('@google/genai');
+require('dotenv').config();
+const Groq = require('groq-sdk');
 
-// Initialize Gemini Client
-const apiKeyToUse = process.env.GEMINI_API_KEY;
-console.log(`[🔑 API KEY CHECK] Using Gemini Key starting with: ${apiKeyToUse ? apiKeyToUse.substring(0, 10) : 'UNDEFINED'}`);
-const ai = new GoogleGenAI({ apiKey: apiKeyToUse });
-
-async function parseIntent(text) {
-    if (!text || text.trim() === '') {
-        return { action: 'ADD', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false, vendor_email: '' };
-    }
-
-    const sanitizedText = text
-        .replace(/<\|.*?\|>/g, '')
-        .replace(/#{1,6}\s/g, '')
-        .trim()
-        .slice(0, 1000); // we only need caption/intent, no need for huge text
-
-    // 🚀 ULTRA-FAST LOCAL BYPASS: Skip AI completely for simple requests
-    const lower = sanitizedText.toLowerCase();
-    
-    // 1. Inquiry Check
-    if (lower.includes('outstanding') || lower.includes('balance') || lower.includes('kitna baki hai') || lower.includes('dues') || lower.includes('hisaab')) {
-        return { action: 'INQUIRY', inquiry_type: 'OUTSTANDING', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false };
-    }
-    // 2. Remove/Sold Check
-    if (lower.includes('remove') || lower.includes('delete') || lower.includes('sold')) {
-        return { action: 'REMOVE', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false, inquiry_type: null };
-    }
-    // 3. Deactivate/Activate Check
-    if (lower === 'deactivate' || lower === 'leave') {
-        return { action: 'DEACTIVATE', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false, inquiry_type: null };
-    }
-    if (lower === 'activate' || lower === 'available now' || lower === 'back to work') {
-        return { action: 'ACTIVATE', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false, inquiry_type: null };
-    }
-    // 4. Pure Numbers Add Check (If they just paste numbers with spaces/newlines)
-    const justNumbersAndSpaces = sanitizedText.replace(/[\d\s,\-\*]/g, '');
-    if (justNumbersAndSpaces === '' && /\d{10}/.test(sanitizedText)) {
-        return { action: 'ADD', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false, inquiry_type: null };
-    }
-
-    // Only if none of the simple rules match, we send it to Gemini AI for complex reading
-    const DELIM_START = "==VENDOR_MSG_START==";
-    const DELIM_END   = "==VENDOR_MSG_END==";
-
-    const systemInstructions = `You are an intent classifier for a VIP mobile number vendor platform.
-Your ONLY job is to parse the vendor message below and return a single JSON object extracting metadata.
-
-OUTPUT SCHEMA (strictly follow this):
-{
-  "action": "ADD" | "REMOVE" | "MIXED" | "DEACTIVATE" | "ACTIVATE" | "INQUIRY" | "IGNORE",
-  "inquiry_type": "OUTSTANDING" | "NUMBERS" | "ALL" | null,
-  "vendorRate": "extracted global rate or price for the numbers if mentioned (e.g., '5000rs', '3000'). Default ''",
-  "vendorDiscount": "percentage or amount explicitly mentioned as discount (e.g. '10%', '200 off'). Default ''",
-  "readyToPort": "RTP" | "CRTP",
-  "keepSpacing": boolean
+// ─── Groq Client Init ─────────────────────────────────────────────────────────
+const groqKey = process.env.GROQ_API_KEY;
+if (!groqKey) {
+    console.error('[❌ GROQ] GROQ_API_KEY not found in .env! AI intent parsing will be unavailable.');
 }
+const groq = new Groq({ apiKey: groqKey });
 
-CLASSIFICATION RULES:
-- MIXED      - vendor explicitly mentions BOTH adding some numbers and removing/sold some numbers in the same message.
-- ADD        - vendor is making numbers available for sale, sending an excel/csv, sending a list of numbers.
-- REMOVE     - vendor says numbers are sold or removing from inventory
-- DEACTIVATE - vendor is unavailable (out of station, on leave, not available, etc.)
-- ACTIVATE   - vendor is available again (back to work, available now, etc.)
-- INQUIRY    - vendor is asking a question about their account (outstanding amount, balance, pending payment, active numbers, "what my outstanding", "kitna baki hai", "dues", "hisaab").
-- IGNORE     - casual chat, greetings, unrelated messages
+// Smart models fallback chain for Groq Free Tier
+const GROQ_MODELS = [
+    'llama-3.3-70b-versatile',
+    'qwen/qwen3-32b',
+    'meta-llama/llama-4-scout-17b-16e-instruct',
+    'openai/gpt-oss-120b',
+    'openai/gpt-oss-20b',
+    'llama-3.1-8b-instant'
+];
 
-EXTRACTION RULES:
-- 'vendorRate': if message mentions a flat price at the end/top like "5000rs", "@ 200", extract it. Do NOT confuse price with discount.
-- 'vendorDiscount': ONLY if message explicitly says "discount", "off", or "%" (e.g., "10% discount", "flat 20%").
-- 'readyToPort': if message mentions "CRTP", use "CRTP". Otherwise use "RTP".
-- 'keepSpacing': if message mentions "keep spacing", "same space", "with space", set to true. Otherwise false.
-- 'inquiry_type': if action is INQUIRY, set this to "OUTSTANDING" (for balance/dues) or "NUMBERS" (for active numbers) or "ALL". Otherwise null.
+// ─── System Prompt ────────────────────────────────────────────────────────────
+const SYSTEM_PROMPT = `You're an intent classifier for Numberwale.com company a VIP mobile number vendor platform. Return ONLY valid JSON:
+{"action":"ADD|REMOVE|MIXED|DEACTIVATE|ACTIVATE|INQUIRY|HELP|IGNORE","inquiry_type":"OUTSTANDING|NUMBERS|ALL|null","vendorRate":"","vendorDiscount":"","readyToPort":"RTP|CRTP","keepSpacing":false,"reply_message":""}
 
-Note: DO NOT extract any phone numbers. Only extract the intent and metadata.`;
+RULES:
+- ADD: vendor sent real 10-digit phone numbers.
+- REMOVE: numbers sent + "sold/remove/delete/nikal".
+- MIXED: both add & remove in same msg.
+- DEACTIVATE: vendor offline (leave/chutti).
+- ACTIVATE: vendor back (available/open).
+- INQUIRY: asking account data (balance/dues/hisaab).
+- HELP: asking how to use bot (NO actual numbers provided).
+- IGNORE: greetings (hi/thanks).
 
-    const prompt = `${systemInstructions}\n\n${DELIM_START}\n${sanitizedText}\n${DELIM_END}\n\nReturn only the JSON object.`;
+EXTRACTION:
+- vendorRate: flat price (e.g. "5000 ka", "@ 3000").
+- vendorDiscount: ONLY if "discount/off/%".
+- readyToPort: "CRTP" if explicitly "CRTP" else "RTP".
+- keepSpacing: true if "keep spacing/with space" else false.
+- reply_message: if IGNORE -> ask for numbers; if HELP -> explain bot usage; else "".
 
-    try {
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash-lite',
-            contents: prompt,
-            config: {
-                temperature: 0,
-                responseMimeType: "application/json",
+NEVER extract phone numbers! Only metadata.`;
+
+// ─── Retry & Model Rotation Helper ───────────────────────────────────────────
+async function callGroqWithRetry(userMessage, maxRetries = 3) {
+    let lastError = null;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        for (let i = 0; i < GROQ_MODELS.length; i++) {
+            const currentModel = GROQ_MODELS[i];
+            try {
+                const completion = await groq.chat.completions.create({
+                    model: currentModel,
+                    messages: [
+                        { role: 'system', content: SYSTEM_PROMPT },
+                        { role: 'user', content: `Vendor message:\n${userMessage}\n\nReturn only the JSON object.` }
+                    ],
+                    temperature: 0,
+                    response_format: { type: 'json_object' },
+                    max_tokens: 300,
+                });
+                return completion.choices[0]?.message?.content?.trim();
+            } catch (err) {
+                lastError = err;
+                const status = err?.status || err?.statusCode || 0;
+
+                if (status === 429) {
+                    console.warn(`[⚠️ GROQ 429] Rate limit hit on ${currentModel}. Switching to next model...`);
+                    continue; // Instantly try the next model
+                }
+                if (status === 503 || status === 500) {
+                    console.warn(`[⚠️ GROQ ${status}] Server issue on ${currentModel}. Switching to next model...`);
+                    continue; // Instantly try the next model
+                }
+                
+                if (status === 401 || status === 403) {
+                    console.error(`[❌ GROQ AUTH] Invalid API key or unauthorized. Check GROQ_API_KEY in .env`);
+                    throw err;
+                }
+                // For other errors, throw immediately
+                throw err;
             }
-        });
-
-        const raw = response.text.trim();
-        return JSON.parse(raw);
-    } catch (err) {
-        if (err.message && err.message.includes('429')) {
-            console.log(`[⚠️ AI RATE LIMIT] Google Gemini is overwhelmed (429). Using offline fallback...`);
-        } else {
-            console.error(`[⚠️ AI ERROR] Intent Parse failed: ${err.message}. Using offline fallback...`);
-        }
-        // Fallback safely with basic regex if API is down or rate limited
-        let lower = text.toLowerCase();
-        if (lower.includes('outstanding') || lower.includes('balance') || lower.includes('kitna baki hai') || lower.includes('dues')) {
-            return { action: 'INQUIRY', inquiry_type: 'OUTSTANDING', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false };
-        } else if (lower.includes('remove') || lower.includes('delete') || lower.includes('sold')) {
-            return { action: 'REMOVE', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false, inquiry_type: null };
-        } else if (lower.includes('deactivate') || lower.includes('leave')) {
-            return { action: 'DEACTIVATE', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false, inquiry_type: null };
-        } else if (lower.includes('activate') || lower.includes('available')) {
-            return { action: 'ACTIVATE', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false, inquiry_type: null };
-        } else if (/\d{10}/.test(text) || text.includes('add')) {
-            // If it has 10 digit numbers, assume ADD
-            return { action: 'ADD', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false, inquiry_type: null };
         }
         
-        return { action: 'IGNORE', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false, inquiry_type: null };
+        // If ALL models failed in this rotation, wait before full retry
+        const waitMs = Math.pow(2, attempt) * 1000;
+        console.warn(`[⚠️ GROQ] All models exhausted in rotation. Attempt ${attempt}/${maxRetries} failed. Retrying in ${waitMs / 1000}s...`);
+        await new Promise(r => setTimeout(r, waitMs));
+    }
+    
+    throw lastError;
+}
+
+// ─── Safe Offline Fallback (only 100% unambiguous cases) ─────────────────────
+// Used ONLY when Groq is completely unreachable (network down, all retries fail)
+function safeOfflineFallback(text) {
+    if (!text || text.trim() === '') {
+        return { action: 'ADD', inquiry_type: null, vendorRate: '', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false, reply_message: '' };
+    }
+    const lower = text.toLowerCase().trim();
+
+    // 100% safe: Pure 10-digit numbers only → ADD
+    const stripped = text.replace(/[\d\s,\-\*\(\)\.]/g, '');
+    if (stripped === '' && /\d{10}/.test(text)) {
+        return { action: 'ADD', inquiry_type: null, vendorRate: '', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false, reply_message: '' };
+    }
+
+    // 100% safe: Exact single-word deactivate/activate commands
+    if (lower === 'deactivate') return { action: 'DEACTIVATE', inquiry_type: null, vendorRate: '', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false, reply_message: '' };
+    if (lower === 'activate') return { action: 'ACTIVATE', inquiry_type: null, vendorRate: '', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false, reply_message: '' };
+
+    // Everything else that's ambiguous → tell vendor AI is temporarily down
+    return {
+        action: 'IGNORE',
+        inquiry_type: null,
+        vendorRate: '',
+        vendorDiscount: '',
+        readyToPort: 'RTP',
+        keepSpacing: false,
+        reply_message: '⚠️ Our AI system is temporarily unavailable. Please try again in a moment.'
+    };
+}
+
+// ─── Main Intent Parser ───────────────────────────────────────────────────────
+async function parseIntent(text) {
+    // Empty message → treat as ADD (document uploads etc.)
+    if (!text || text.trim() === '') {
+        return { action: 'ADD', inquiry_type: null, vendorRate: '', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false, reply_message: '' };
+    }
+
+    let compressedText = text
+        .replace(/<\|.*?\|>/g, '')
+        .replace(/#{1,6}\s/g, '')
+        // Replace exact 10-digit phone number patterns (including spaces/dashes and +91/0 prefix) with [NUM]
+        .replace(/(?:\+91|0|91)?\s*(?:\d[\s-]*){10}(?!\d)/g, '[NUM]');
+    
+    // Compress multiple [NUM]s across newlines into a single [NUMBERS] to save tokens
+    compressedText = compressedText.replace(/(?:\[NUM\]\s*){2,}/g, '[NUMBERS]\n');
+
+    const sanitizedText = compressedText.trim().slice(0, 1000);
+
+    // console.log(`[🤖 AI PAYLOAD] Compressed to ${sanitizedText.length} chars:\n${sanitizedText}`);
+
+    try {
+        const raw = await callGroqWithRetry(sanitizedText, 3);
+        const parsed = JSON.parse(raw);
+        const isCrtp = /crtp|current\s*ready\s*to\s*port/i.test(text);
+        return {
+            action: parsed.action || 'IGNORE',
+            inquiry_type: parsed.inquiry_type || null,
+            vendorRate: parsed.vendorRate || '',
+            vendorDiscount: parsed.vendorDiscount || '',
+            readyToPort: isCrtp ? 'CRTP' : 'RTP',
+            keepSpacing: parsed.keepSpacing || false,
+            reply_message: parsed.reply_message || '',
+        };
+    } catch (err) {
+        const status = err?.status || err?.statusCode || 0;
+        if (status === 429) {
+            console.error(`[❌ GROQ] Rate limit exhausted after all retries. Upgrade to Groq paid plan for higher limits.`);
+        } else {
+            console.error(`[❌ GROQ] parseIntent failed (status ${status}): ${err.message}`);
+        }
+        console.warn(`[⚠️ FALLBACK] Groq unavailable. Using safe offline fallback.`);
+        return safeOfflineFallback(text);
     }
 }
 
-async function generateReply(action, validCount, invalidNumbers, failedIds, unauthorizedIds, inquiryData) {
-    // For fast replies on INQUIRY or DEACTIVATE, we don't need AI. Just hardcode them.
-    if (action === 'DEACTIVATE') return "⏸️ Your numbers have been temporarily deactivated.";
-    if (action === 'ACTIVATE') return "▶️ Your numbers are now available again.";
-    
+// ─── Reply Generator ──────────────────────────────────────────────────────────
+async function generateReply(action, validCount, invalidNumbers, failedIds, unauthorizedIds, inquiryData, noRateNumbers = [], apiResult = null, keepSpacing = false) {
+    if (action === 'DEACTIVATE') {
+        if (apiResult && apiResult.message === 'Vendor is already deactivated') return '⏸️ Your numbers are already deactivated.';
+        return '⏸️ Your numbers have been temporarily deactivated.';
+    }
+    if (action === 'ACTIVATE') {
+        if (apiResult && apiResult.message === 'Vendor is already activated') return '▶️ Your numbers are already active.';
+        return '▶️ Your numbers are now active and available again.';
+    }
+
+    if (action === 'HELP') {
+        return `*How to Add Numbers:*\n\n` +
+               `_Example 1 (Mixed Discounts):_\n` +
+               `Add RTP/ CRTP\n` +
+               `1234567890 8365 12%\n` +
+               `0987654321 8462 5%\n\n` +
+               `_Example 2 (Specific Porting):_\n` +
+               `Add\n` +
+               `1234567890 9037\n` +
+               `0987654321 9265 CRTP\n` +
+               `*(1234567890 will go to RTP, 0987654321 to CRTP)*\n\n` +
+               `_Example 3 (Global Discount):_\n` +
+               `Add\n` +
+               `1234567890 8463\n` +
+               `0987654321 8634\n` +
+               `all 12% discount\n\n` +
+               `_Example 4 (Keep Spacing):_\n` +
+               `Add keep spacing\n` +
+               `123 45 67 890 5000 12%\n\n` +
+               `_Example 5 (Mixed - Add & Sold together):_\n` +
+               `Add RTP\n` +
+               `1234567890 8365 12%\n` +
+               `0987654321 8462 5%\n\n` +
+               `Sold\n` +
+               `9876543210\n` +
+               `8765432109\n\n` +
+               `*How to Mark Numbers as Sold:*\n\n` +
+               `Sold\n` +
+               `1234567890\n` +
+               `0987654321\n\n` +
+               `*Spacing Logic:*\n` +
+               `• Default: System auto-spaces numbers (e.g. 12345 67890).\n` +
+               `• Custom: Add "keep spacing" or "with space" in your message to use your exact spacing.\n` +
+               `• Excel: If you upload an Excel file, the system auto-spaces unless the file name contains "keep space" or "with spacing".\n\n` +
+               `*For Balance Inquiry:*\n` +
+               `Just say "hisaab", "outstanding", or "balance".`;
+    }
+
     if (action === 'INQUIRY' && inquiryData) {
-        const formatCurrency = (val) => `₹${Number(val || 0).toLocaleString('en-IN')}`;
-        const comb = inquiryData.combinedTotals;
+        const fmt = (val) => `₹${Number(val || 0).toLocaleString('en-IN')}`;
+        const c = inquiryData.combinedTotals;
         let reply = `📊 *Your Account Summary*\n👨‍💼 Vendor: ${inquiryData.vendorName}\n\n💵 *Payment Details:*\n`;
-        reply += `• Total Paid: ${formatCurrency(comb.paid)}\n`;
-        reply += `• Pending: ${formatCurrency(comb.pending)}\n`;
-        reply += `• To Be Paid: ${formatCurrency(comb.toBePaid)}\n`;
-        reply += `*Total Outstanding: ${formatCurrency(comb.balanceTotal)}*\n\n`;
+        reply += `• Total Paid: ${fmt(c.paid)}\n`;
+        reply += `• Pending: ${fmt(c.pending)}\n`;
+        reply += `• To Be Paid: ${fmt(c.toBePaid)}\n`;
+        reply += `*Total Outstanding: ${fmt(c.balanceTotal)}*\n\n`;
         reply += `📱 *Active Numbers on Website:* ${inquiryData.activeNumbers || 0}`;
         return reply;
     }
 
     if (action === 'REMOVE') {
-        let msg = validCount > 0 ? `✅ Removed ${validCount} numbers successfully.` : `❌ No numbers were removed.`;
-        if (failedIds && failedIds.length > 0) msg += `\n⚠️ Not found or already sold:\n${failedIds.join(', ')}`;
-        if (unauthorizedIds && unauthorizedIds.length > 0) msg += `\n⚠️ Not authorized to remove:\n${unauthorizedIds.join(', ')}`;
-        return msg;
+        let msg = '';
+        if (validCount > 0) {
+            msg += `✅ *These numbers are sold:*\n`;
+            // Assuming we don't have the exact list of successfully removed numbers here,
+            // we will adjust the msg text. Wait, validCount is a number, we don't have the list.
+            // But the user said: "this numbers are sold: 1234...". If we don't have the list, we can just say "✅ X numbers are sold."
+            msg += `Successfully marked ${validCount} numbers as sold.\n\n`;
+        }
+        
+        let notSold = [...(failedIds || []), ...(unauthorizedIds || [])];
+        if (notSold.length > 0) {
+            msg += `❌ *These numbers are not sold because they are not added by you / not yours:*\n`;
+            notSold.forEach(num => { msg += `${num}\n`; });
+        }
+        
+        if (validCount === 0 && notSold.length === 0) {
+            msg = `❌ No valid numbers were found to remove.`;
+        }
+        
+        return msg.trim();
     }
 
     if (action === 'ADD') {
-        // itemsToAdd is passed in place of validCount for ADD
         const itemsToAdd = validCount || [];
         const addedCount = itemsToAdd.length;
 
-        if (addedCount === 0 && (!invalidNumbers || invalidNumbers.length === 0)) {
-            return "❌ Koi valid numbers nahi mile.";
+        if (addedCount === 0 && (!invalidNumbers || invalidNumbers.length === 0) && (!noRateNumbers || noRateNumbers.length === 0)) {
+            return '❌ No valid numbers found.';
         }
 
-        let reply = "";
-        
+        let reply = '';
         if (addedCount > 0) {
             reply += `✅ *Successfully Added (${addedCount}):*\n`;
+            if (keepSpacing) {
+                reply += `_(Numbers added according to your spacing)_\n\n`;
+            } else {
+                reply += `_(Spaces are auto generated)_\n\n`;
+            }
             itemsToAdd.forEach(item => {
-                let rateStr = item.rate ? `Rs. ${item.rate}` : `Rs. 0`;
+                const rateStr = item.rate ? `Rs. ${item.rate}` : `Rs. 0`;
                 let discStr = item.discount && item.discount !== '0' ? `${item.discount}` : `0%`;
                 if (!discStr.includes('%') && discStr !== '0%') discStr += '%';
-                let finalDisplayNumber = (item.styledNumber || item.number).replace(/-/g, ' ').replace(/\*/g, '');
-                reply += `${finalDisplayNumber} | ${rateStr} | ${discStr} | ${item.port}\n`;
+                const displayNum = (item.styledNumber || item.number).replace(/-/g, ' ').replace(/\*/g, '');
+                reply += `${displayNum} | ${rateStr} | ${discStr} | ${item.port}\n`;
             });
+        }
+
+        if (noRateNumbers && noRateNumbers.length > 0) {
+            if (reply.length > 0) reply += '\n';
+            reply += `⚠️ *Not Added (Missing Rate):*\n`;
+            noRateNumbers.forEach(inv => { reply += `• ${inv}\n`; });
         }
 
         if (invalidNumbers && invalidNumbers.length > 0) {
-            if (reply.length > 0) reply += `\n`;
-            reply += `❌ *Not Added (Invalid 10-Digit Format):*\n`;
-            invalidNumbers.forEach(inv => {
-                reply += `• ${inv}\n`;
-            });
+            if (reply.length > 0) reply += '\n';
+            reply += `❌ *Not Added (Invalid 9 or 11 Digit Format):*\n`;
+            invalidNumbers.forEach(inv => { reply += `• ${inv}\n`; });
         }
 
         return reply.trim();
@@ -174,7 +293,4 @@ async function generateReply(action, validCount, invalidNumbers, failedIds, unau
     return "⚠️ I didn't quite catch that. Please send a valid list of numbers or an excel file.";
 }
 
-module.exports = {
-    parseIntent,
-    generateReply
-};
+module.exports = { parseIntent, generateReply };
