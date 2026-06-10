@@ -1,12 +1,19 @@
 require('dotenv').config();
 const Groq = require('groq-sdk');
+const OpenAI = require('openai');
 
-// ─── Groq Client Init ─────────────────────────────────────────────────────────
+// ─── Clients Init ─────────────────────────────────────────────────────────
 const groqKey = process.env.GROQ_API_KEY;
 if (!groqKey) {
-    console.error('[❌ GROQ] GROQ_API_KEY not found in .env! AI intent parsing will be unavailable.');
+    console.warn('[⚠️ GROQ] GROQ_API_KEY not found in .env! Skipping Groq models.');
 }
-const groq = new Groq({ apiKey: groqKey });
+const groq = groqKey ? new Groq({ apiKey: groqKey }) : null;
+
+const openaiKey = process.env.OPENAI_API_KEY;
+if (!openaiKey) {
+    console.warn('[⚠️ OPENAI] OPENAI_API_KEY not found in .env! OpenAI fallback will be unavailable.');
+}
+const openai = openaiKey ? new OpenAI({ apiKey: openaiKey }) : null;
 
 // Smart models fallback chain for Groq Free Tier
 const GROQ_MODELS = [
@@ -42,14 +49,16 @@ EXTRACTION:
 NEVER extract phone numbers! Only metadata.`;
 
 // ─── Retry & Model Rotation Helper ───────────────────────────────────────────
-async function callGroqWithRetry(userMessage, maxRetries = 3) {
+async function callLLMWithRetry(userMessage, maxRetries = 3) {
     let lastError = null;
     
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        for (let i = 0; i < GROQ_MODELS.length; i++) {
-            const currentModel = GROQ_MODELS[i];
-            try {
-                const completion = await groq.chat.completions.create({
+        // --- 1. Try All Groq Models First ---
+        if (groq) {
+            for (let i = 0; i < GROQ_MODELS.length; i++) {
+                const currentModel = GROQ_MODELS[i];
+                try {
+                    const completion = await groq.chat.completions.create({
                     model: currentModel,
                     messages: [
                         { role: 'system', content: SYSTEM_PROMPT },
@@ -65,26 +74,52 @@ async function callGroqWithRetry(userMessage, maxRetries = 3) {
                 const status = err?.status || err?.statusCode || 0;
 
                 if (status === 429) {
-                    console.warn(`[⚠️ GROQ 429] Rate limit hit on ${currentModel}. Switching to next model...`);
+                    console.warn(`[⚠️ GROQ 429] Rate limit hit on ${currentModel}. Switching to next...`);
                     continue; // Instantly try the next model
                 }
                 if (status === 503 || status === 500) {
-                    console.warn(`[⚠️ GROQ ${status}] Server issue on ${currentModel}. Switching to next model...`);
+                    console.warn(`[⚠️ GROQ ${status}] Server issue on ${currentModel}. Switching to next...`);
                     continue; // Instantly try the next model
                 }
                 
                 if (status === 401 || status === 403) {
-                    console.error(`[❌ GROQ AUTH] Invalid API key or unauthorized. Check GROQ_API_KEY in .env`);
-                    throw err;
+                    console.error(`[❌ GROQ AUTH] Invalid API key or unauthorized. Skipping Groq...`);
+                    break; // Break out of Groq loop to allow OpenAI fallback
                 }
-                // For other errors, throw immediately
-                throw err;
+                // For other errors, log and continue to next model
+                console.warn(`[⚠️ GROQ] Error on ${currentModel}: ${err.message}`);
+                continue;
             }
         }
+        }
         
-        // If ALL models failed in this rotation, wait before full retry
+        // --- 2. Fallback to OpenAI if all Groq models fail ---
+        if (openai) {
+            try {
+                if (groq) console.warn(`[⚠️ FALLBACK] All Groq models failed. Falling back to OpenAI (gpt-4o-mini)...`);
+                const completion = await openai.chat.completions.create({
+                    model: 'gpt-4o-mini',
+                    messages: [
+                        { role: 'system', content: SYSTEM_PROMPT },
+                        { role: 'user', content: `Vendor message:\n${userMessage}\n\nReturn only the JSON object.` }
+                    ],
+                    temperature: 0,
+                    response_format: { type: 'json_object' },
+                    max_tokens: 300,
+                });
+                return completion.choices[0]?.message?.content?.trim();
+            } catch (err) {
+                lastError = err;
+                const status = err?.status || err?.statusCode || 0;
+                console.warn(`[⚠️ OPENAI] Fallback failed (status ${status}): ${err.message}`);
+            }
+        } else {
+            console.warn(`[⚠️ OPENAI] No OPENAI_API_KEY provided for fallback.`);
+        }
+        
+        // If ALL models (Groq + OpenAI) failed in this rotation, wait before full retry
         const waitMs = Math.pow(2, attempt) * 1000;
-        console.warn(`[⚠️ GROQ] All models exhausted in rotation. Attempt ${attempt}/${maxRetries} failed. Retrying in ${waitMs / 1000}s...`);
+        console.warn(`[⚠️ AI] All AI models exhausted. Attempt ${attempt}/${maxRetries} failed. Retrying in ${waitMs / 1000}s...`);
         await new Promise(r => setTimeout(r, waitMs));
     }
     
@@ -142,7 +177,7 @@ async function parseIntent(text) {
     // console.log(`[🤖 AI PAYLOAD] Compressed to ${sanitizedText.length} chars:\n${sanitizedText}`);
 
     try {
-        const raw = await callGroqWithRetry(sanitizedText, 3);
+        const raw = await callLLMWithRetry(sanitizedText, 3);
         const parsed = JSON.parse(raw);
         const isCrtp = /crtp|current\s*ready\s*to\s*port/i.test(text);
         return {
@@ -157,11 +192,11 @@ async function parseIntent(text) {
     } catch (err) {
         const status = err?.status || err?.statusCode || 0;
         if (status === 429) {
-            console.error(`[❌ GROQ] Rate limit exhausted after all retries. Upgrade to Groq paid plan for higher limits.`);
+            console.error(`[❌ AI] Rate limit exhausted after all retries on all models.`);
         } else {
-            console.error(`[❌ GROQ] parseIntent failed (status ${status}): ${err.message}`);
+            console.error(`[❌ AI] parseIntent failed (status ${status}): ${err.message}`);
         }
-        console.warn(`[⚠️ FALLBACK] Groq unavailable. Using safe offline fallback.`);
+        console.warn(`[⚠️ FALLBACK] All AI models unavailable. Using safe offline fallback.`);
         return safeOfflineFallback(text);
     }
 }

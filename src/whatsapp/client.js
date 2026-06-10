@@ -16,9 +16,12 @@ function getBotStatus() {
 
 async function processVendorMessage(sock, msg, sender, vendorId) {
     try {
-        const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.imageMessage?.caption || msg.message.documentMessage?.caption || '';
-        const isDocument = !!msg.message.documentMessage;
-        const isImageOrVideo = !!msg.message.imageMessage || !!msg.message.videoMessage;
+        // WhatsApp sometimes wraps documents with captions in documentWithCaptionMessage
+        const actualMessage = msg.message.documentWithCaptionMessage?.message || msg.message;
+        
+        const textMessage = actualMessage.conversation || actualMessage.extendedTextMessage?.text || actualMessage.imageMessage?.caption || actualMessage.documentMessage?.caption || '';
+        const isDocument = !!actualMessage.documentMessage;
+        const isImageOrVideo = !!actualMessage.imageMessage || !!actualMessage.videoMessage;
 
         // Ignore images and videos without documents
         if (isImageOrVideo) {
@@ -35,8 +38,8 @@ async function processVendorMessage(sock, msg, sender, vendorId) {
         let docMime = '';
         let docFileName = '';
         if (isDocument) {
-            docMime = msg.message.documentMessage.mimetype || '';
-            docFileName = msg.message.documentMessage.fileName || '';
+            docMime = actualMessage.documentMessage.mimetype || '';
+            docFileName = actualMessage.documentMessage.fileName || '';
             const validDocs = ['.xlsx', '.xls', '.csv'];
             const isValidDoc = validDocs.some(ext => docFileName.toLowerCase().endsWith(ext)) || 
                                docMime.includes('spreadsheet') || 
@@ -65,6 +68,12 @@ async function processVendorMessage(sock, msg, sender, vendorId) {
         console.log(`   ➜ Action: ${parsedIntent.action}`);
         console.log(`   ➜ Discount: ${parsedIntent.vendorDiscount || 'None'}`);
         console.log(`   ➜ Keep Spacing: ${parsedIntent.keepSpacing}`);
+
+        // If it's a document, don't let AI ignore it just because the caption was short/meaningless
+        if (isDocument && (parsedIntent.action === 'IGNORE' || parsedIntent.action === 'HELP')) {
+            console.log(`[🤖 AI OVERRIDE] Document detected with vague caption. Overriding ${parsedIntent.action} to ADD.`);
+            parsedIntent.action = 'ADD';
+        }
 
         if (parsedIntent.action === 'IGNORE' || parsedIntent.action === 'HELP') {
              console.log(`[⏭️ ${parsedIntent.action}] AI marked as ${parsedIntent.action}.`);
@@ -104,8 +113,11 @@ async function processVendorMessage(sock, msg, sender, vendorId) {
 
         if (isDocument) {
             console.log(`[📁 EXCEL] Downloading document: ${docFileName}...`);
+            // We need to pass the wrapped message if it exists so Baileys can find the media key
+            const msgToDownload = msg.message.documentWithCaptionMessage ? { message: msg.message.documentWithCaptionMessage.message } : msg;
+            
             addBuffer = await downloadMediaMessage(
-                msg,
+                msgToDownload,
                 'buffer',
                 {},
                 { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
