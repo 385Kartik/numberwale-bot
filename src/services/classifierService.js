@@ -598,7 +598,7 @@ function splitMixedIntentText(text) {
 
         // If the line is mostly text (no digits) and contains keywords, switch mode
         if (!hasDigits) {
-            if (lower.includes('sold') || lower.includes('remove') || lower.includes('delete') || lower.includes('out of stock')) {
+            if (lower.includes('sold') || lower.includes('remove') || lower.includes('dead') || lower.includes('delete') || lower.includes('out of stock')) {
                 currentMode = 'REMOVE';
             } else if (lower.includes('add') || lower.includes('available') || lower.includes('new stock') || lower.includes('live')) {
                 currentMode = 'ADD';

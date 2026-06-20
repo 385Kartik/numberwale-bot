@@ -22,7 +22,7 @@ async function processVendorMessage(sock, msg, sender, vendorId) {
         const textMessage = actualMessage.conversation || actualMessage.extendedTextMessage?.text || actualMessage.imageMessage?.caption || actualMessage.documentMessage?.caption || '';
         const isDocument = !!actualMessage.documentMessage;
         const isImageOrVideo = !!actualMessage.imageMessage || !!actualMessage.videoMessage;
-
+        
         // Ignore images and videos without documents
         if (isImageOrVideo) {
             console.log(`[⏭️ IGNORED] Image/Video ignored as per rules.`);
