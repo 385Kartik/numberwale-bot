@@ -41,9 +41,9 @@ const SYSTEM_PROMPT = `You're an intent classifier for Numberwale.com company a 
 
 RULES:
 - ADD: vendor sent real 10-digit phone numbers.
-- REMOVE: numbers sent + "sold/remove/delete/nikal".
+- REMOVE: numbers sent + "sold/remove/delete/nikal/dead". (Note: 'dead' means sold by vendor, so it is REMOVE).
 - MIXED: both add & remove in same msg.
-- DEACTIVATE: vendor offline (leave/chutti).
+- DEACTIVATE: ONLY if vendor EXPLICITLY says "deactivate all numbers", "I am on leave", or "chutti". Do NOT trigger this for "dead" or random words.
 - ACTIVATE: vendor back (available/open).
 - INQUIRY: asking account data (balance/dues/hisaab) OR asking for PDF statement (mera statement / my statement / download statement -> inquiry_type: "STATEMENT").
 - HELP: asking how to use bot (NO actual numbers provided).

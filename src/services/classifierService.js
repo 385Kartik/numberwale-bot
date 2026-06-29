@@ -520,9 +520,9 @@ function processExcelBuffer(buffer, globalVendorDiscount = null, globalVendorSta
     for (let i = 0; i < headers.length; i++) {
         let h = String(headers[i] || '').toLowerCase().trim();
         if (h === 'vanity number') numColIdx = i;
-        else if (numColIdx === -1 && (h.includes('number') || h.includes('mobile'))) numColIdx = i;
+        else if (numColIdx === -1 && (h.includes('number') || h.includes('mobile') || h.includes('cell'))) numColIdx = i;
         
-        if (h === 'vendor rate' || h === 'rate' || h === 'price') rateColIdx = i;
+        if (h === 'vendor rate' || h === 'rate' || h === 'price' || h === 'amount') rateColIdx = i;
         if (h === 'discount' || h === 'dis' || h === 'discounts' || h === 'vendor discount') discountColIdx = i;
         if (h === 'status' || h === 'rtp' || h === 'crtp' || h === 'type') statusColIdx = i;
     }
