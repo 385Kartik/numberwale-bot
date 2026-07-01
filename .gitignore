@@ -2,3 +2,5 @@
 node_modules
 package-lock.json
 auth_info_baileys
+.wwebjs_cache
+wwebjs_auth
